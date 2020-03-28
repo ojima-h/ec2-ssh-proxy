@@ -6,11 +6,13 @@ import (
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/ec2"
+	"github.com/aws/aws-sdk-go/service/ec2/ec2iface"
 	"github.com/aws/aws-sdk-go/service/ec2instanceconnect"
+	"github.com/aws/aws-sdk-go/service/ec2instanceconnect/ec2instanceconnectiface"
 	"github.com/aws/aws-sdk-go/service/ssm"
+	"github.com/aws/aws-sdk-go/service/ssm/ssmiface"
 	"github.com/jessevdk/go-flags"
 	"io/ioutil"
-	"log"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -31,123 +33,260 @@ func main() {
 }
 
 func run() error {
+	params, err := parseArgs(os.Args[1:])
+	if err != nil {
+		return err
+	}
+
+	cli := newClient(params.Profile)
+
+	instanceId, availabilityZone, err := cli.findInstance(params)
+	if err != nil {
+		return err
+	}
+
+	err = cli.sendPublicKey(params, instanceId, availabilityZone)
+	if err != nil {
+		return err
+	}
+
+	ssmIn, ssmOut, err := cli.startSession(params, instanceId)
+	if err != nil {
+		return err
+	}
+
+	err = cli.checkSessionManagerPlugin()
+	if err != nil {
+		return err
+	}
+
+	err = cli.startSessionManagerPlugin(params, ssmIn, ssmOut)
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+/*
+ * Parse arguments
+ */
+
+type Params struct {
+	Profile   string
+	User      string
+	Port      int
+	PublicKey string
+	// ec2 filter
+	Id   string
+	Name string
+}
+
+func parseArgs(args []string) (*Params, error) {
+	ret := Params{}
+
 	var opts struct {
-		Pattern string `long:"pattern" description:"Host name pattern" default:"ec2:%(name)"`
+		Pattern string `long:"pattern" description:"Host name pattern" default:"ec2.%(name)"`
 		Profile string `long:"profile" description:"Aws credentials profile name"`
-		KeyFile string `long:"public-key" description:"SSH public key file path"`
-		User    string `long:"user" description:"OS user on the EC2 instance"`
+		KeyFile string `long:"public-key" description:"SSH public key file path" default:"~/.ssh/id_rsa.pub"`
+		User    string `long:"user" description:"OS user on the EC2 instance" default:"ec2-user"`
 		Args    struct {
-			HOST    string
-			PORT    int
+			HOST string
+			PORT int
 		} `positional-args:"yes" required:"yes"`
 	}
-	_, err := flags.Parse(&opts)
+	_, err := flags.NewParser(&opts, flags.HelpFlag|flags.PassDoubleDash).ParseArgs(args)
 	if err != nil {
-		return fmt.Errorf("")
+		return nil, err
 	}
-	if opts.KeyFile == "" {
+
+	ret.Profile = opts.Profile
+	ret.User = opts.User
+	ret.Port = opts.Args.PORT
+
+	// read SSH public key
+	kf := opts.KeyFile
+	if strings.HasPrefix(kf, "~/") {
 		h, err := os.UserHomeDir()
 		if err != nil {
-			return err
+			return nil, err
 		}
-		opts.KeyFile = filepath.Join(h, ".ssh/id_rsa.pub")
+		kf = filepath.Join(h, kf[2:])
 	}
-	if opts.User == "" {
-		opts.User = "ec2-user"
-	}
-	attrs, err := parseHost(opts.Args.HOST, opts.Pattern)
+	k, err := ioutil.ReadFile(kf)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	if attrs.Profile == "" {
-		attrs.Profile = opts.Profile
-	}
+	ret.PublicKey = string(k)
 
-	publicKey, err := ioutil.ReadFile(opts.KeyFile)
+	err = parseHostname(opts.Args.HOST, opts.Pattern, &ret)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
-	cli := newAwscli(attrs.Profile)
+	return &ret, nil
+}
 
-	in1 := ec2.DescribeInstancesInput{}
-	if attrs.Name != "" {
-		in1.Filters = []*ec2.Filter{
+func parseHostname(hostname string, pattern string, p *Params) error {
+	pat := pattern
+	pat = strings.ReplaceAll(pat, "{name}", `(?P<name>[\w-]+)`)
+	pat = strings.ReplaceAll(pat, "{id}", `(?P<id>[\w-]+)`)
+	pat = strings.ReplaceAll(pat, "{profile}", `(?P<profile>[\w-]+)`)
+
+	re, err := regexp.Compile(pat)
+	if err != nil {
+		return fmt.Errorf("invalid host name pattern: %s", pattern)
+	}
+
+	keys := re.SubexpNames()
+	vals := re.FindStringSubmatch(hostname)
+	for i, k := range keys {
+		v := vals[i]
+		if k == "name" {
+			p.Name = v
+		}
+		if k == "id" {
+			p.Id = v
+		}
+		if k == "profile" {
+			p.Profile = v
+		}
+	}
+
+	if p.Name != "" && p.Id != "" {
+		return fmt.Errorf("name and id could not be specified at same time")
+	}
+	if p.Name == "" && p.Id == "" {
+		return fmt.Errorf("neither name nor id is specified")
+	}
+
+	return nil
+}
+
+/*
+ * AWS client
+ */
+
+type Client struct {
+	ec2   ec2iface.EC2API
+	ec2ic ec2instanceconnectiface.EC2InstanceConnectAPI
+	ssm   ssmiface.SSMAPI
+
+	ssmSigningRegion string
+	ssmEndpoint      string
+}
+
+func newClient(profile string) *Client {
+	c := Client{}
+
+	sess := session.Must(session.NewSessionWithOptions(session.Options{
+		Profile:           profile,
+		SharedConfigState: session.SharedConfigEnable,
+	}))
+	c.ec2 = ec2.New(sess)
+	c.ec2ic = ec2instanceconnect.New(sess)
+
+	s := ssm.New(sess)
+	c.ssm = s
+	c.ssmSigningRegion = s.SigningRegion
+	c.ssmEndpoint = s.Endpoint
+
+	return &c
+}
+
+func (c *Client) findInstance(params *Params) (instanceId string, availabilityZone string, err error) {
+	in := ec2.DescribeInstancesInput{}
+	if params.Name != "" {
+		in.Filters = []*ec2.Filter{
 			{
 				Name:   aws.String("tag:Name"),
-				Values: []*string{aws.String(attrs.Name)},
+				Values: []*string{aws.String(params.Name)},
 			},
 		}
 	}
-	if attrs.Id != "" {
-		in1.InstanceIds = []*string{
-			aws.String(attrs.Id),
+	if params.Id != "" {
+		in.InstanceIds = []*string{
+			aws.String(params.Id),
 		}
 	}
-	out1, err := cli.DescribeInstances(&in1)
+	out, err := c.ec2.DescribeInstances(&in)
 	if err != nil {
-		return err
+		return
 	}
-	if len(out1.Reservations) == 0 || len(out1.Reservations[0].Instances) == 0 {
-		return fmt.Errorf("ec2 instance is not found")
+	if len(out.Reservations) == 0 || len(out.Reservations[0].Instances) == 0 {
+		err = fmt.Errorf("ec2 instance is not found")
+		return
 	}
 
-	instanceId := aws.StringValue(out1.Reservations[0].Instances[0].InstanceId)
-	availabilityZone := aws.StringValue(out1.Reservations[0].Instances[0].Placement.AvailabilityZone)
+	instanceId = aws.StringValue(out.Reservations[0].Instances[0].InstanceId)
+	availabilityZone = aws.StringValue(out.Reservations[0].Instances[0].Placement.AvailabilityZone)
+	return
+}
 
-	in2 := ec2instanceconnect.SendSSHPublicKeyInput{
+func (c *Client) sendPublicKey(params *Params, instanceId string, availabilityZone string) error {
+	in := ec2instanceconnect.SendSSHPublicKeyInput{
 		AvailabilityZone: aws.String(availabilityZone),
 		InstanceId:       aws.String(instanceId),
-		InstanceOSUser: aws.String(opts.User),
-		SSHPublicKey: aws.String(string(publicKey)),
+		InstanceOSUser:   aws.String(params.User),
+		SSHPublicKey:     aws.String(params.PublicKey),
 	}
-	_, err = cli.ec2ic.SendSSHPublicKey(&in2)
+	_, err := c.ec2ic.SendSSHPublicKey(&in)
 	if err != nil {
 		return err
 	}
 
-	in3 := ssm.StartSessionInput{
+	return nil
+}
+
+func (c *Client) startSession(params *Params, instanceId string) (in *ssm.StartSessionInput, out *ssm.StartSessionOutput, err error) {
+	in = &ssm.StartSessionInput{
 		Target:       aws.String(instanceId),
 		DocumentName: aws.String("AWS-StartSSHSession"),
-		Parameters:   map[string][]*string{
-			"portNumber": { aws.String(strconv.Itoa(opts.Args.PORT)) },
+		Parameters: map[string][]*string{
+			"portNumber": {aws.String(strconv.Itoa(params.Port))},
 		},
 	}
-	out3, err := cli.StartSession(&in3)
+	out, err = c.ssm.StartSession(in)
 	if err != nil {
-		return err
+		return
 	}
 
-	j1, err := json.Marshal(in3)
+	return
+}
+
+func (*Client) checkSessionManagerPlugin() error {
+	_, err := exec.LookPath("session-manager-plugin")
 	if err != nil {
-		return err
-	}
-	j2, err := json.Marshal(out3)
-	if err != nil {
-		return err
-	}
-	cmd := exec.Command(
-		"session-manager-plugin",
-		string(j2),
-		cli.ssm.SigningRegion,
-		"StartSession",
-		attrs.Profile,
-		string(j1),
-		cli.ssm.Endpoint,
-	)
-	cmd.Stdin = os.Stdin
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	if cmd.Path == "" {
-		_, err1 := cli.ssm.TerminateSession(&ssm.TerminateSessionInput{SessionId: out3.SessionId})
-		if err1 != nil {
-			log.Printf("[WARN] %s", err1.Error())
-		}
 		return fmt.Errorf("SessionManagerPlugin is not found. \n" +
 			"Please refer to SessionManager Documentation here: \n" +
 			"http://docs.aws.amazon.com/console/systems-manager/\n" +
 			"session-manager-plugin-not-found")
 	}
+	return nil
+}
+
+func (c *Client) startSessionManagerPlugin(params *Params, in *ssm.StartSessionInput, out *ssm.StartSessionOutput) error {
+	i, err := json.Marshal(in)
+	if err != nil {
+		return err
+	}
+	o, err := json.Marshal(out)
+	if err != nil {
+		return err
+	}
+
+	cmd := exec.Command(
+		"session-manager-plugin",
+		string(o),
+		c.ssmSigningRegion,
+		"StartSession",
+		params.Profile,
+		string(i),
+		c.ssmEndpoint,
+	)
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
 
 	ignoreUserSignals(func() {
 		err = cmd.Run()
@@ -159,84 +298,16 @@ func run() error {
 	return nil
 }
 
-type HostAttributes struct {
-	Name string
-	Id string
-	Profile string
-}
-
-func parseHost(hostname string, pattern string) (*HostAttributes, error) {
-	pat := pattern
-	pat = strings.ReplaceAll(pat, "{name}", `(?P<name>[\w-]+)`)
-	pat = strings.ReplaceAll(pat, "{id}", `(?P<id>[\w-]+)`)
-	pat = strings.ReplaceAll(pat, "{profile}", `(?P<profile>[\w-]+)`)
-
-	re, err := regexp.Compile(pat)
-	if err != nil {
-		return nil, fmt.Errorf("invalid host name pattern: %s", pattern)
-	}
-
-	keys := re.SubexpNames()
-	vals := re.FindStringSubmatch(hostname)
-	attrs := HostAttributes{}
-	for i, k := range keys {
-		v := vals[i]
-		if k == "name" {
-			attrs.Name = v
-		}
-		if k == "id" {
-			attrs.Id = v
-		}
-		if k == "profile" {
-			attrs.Profile = v
-		}
-	}
-
-	if attrs.Name != "" && attrs.Id != "" {
-		return nil, fmt.Errorf("name and id could not be specified at same time")
-	}
-	if attrs.Name == "" && attrs.Id == "" {
-		return nil, fmt.Errorf("neither name nor id is specified")
-	}
-
-	return &attrs, nil
-}
-
-type awscli struct {
-	sess *session.Session
-	ec2 *ec2.EC2
-	ec2ic *ec2instanceconnect.EC2InstanceConnect
-	ssm *ssm.SSM
-}
-
-func newAwscli(profile string) *awscli {
-	c := awscli{}
-
-	c.sess = session.Must(session.NewSessionWithOptions(session.Options{
-		Profile: profile,
-		SharedConfigState: session.SharedConfigEnable,
-	}))
-	c.ec2 = ec2.New(c.sess)
-	c.ec2ic = ec2instanceconnect.New(c.sess)
-	c.ssm = ssm.New(c.sess)
-
-	return &c
-}
-
-func (c *awscli) DescribeInstances(input *ec2.DescribeInstancesInput) (*ec2.DescribeInstancesOutput, error) {
-	return c.ec2.DescribeInstances(input)
-}
-
-func (c *awscli) StartSession(input *ssm.StartSessionInput) (*ssm.StartSessionOutput, error) {
-	return c.ssm.StartSession(input)
-}
+/*
+ * Utility functions
+ */
 
 func ignoreUserSignals(f func()) {
 	var sig []os.Signal
 	if runtime.GOOS == "windows" {
-		sig = []os.Signal{ syscall.SIGINT }
+		sig = []os.Signal{syscall.SIGINT}
 	} else {
-		sig = []os.Signal{ syscall.SIGINT, syscall.SIGQUIT, syscall.SIGTSTP }
+		sig = []os.Signal{syscall.SIGINT, syscall.SIGQUIT, syscall.SIGTSTP}
 	}
 
 	signal.Ignore(sig...)
