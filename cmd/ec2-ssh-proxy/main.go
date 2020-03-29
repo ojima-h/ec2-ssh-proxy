@@ -38,29 +38,30 @@ func run() error {
 		return err
 	}
 
-	cli := newClient(params.Profile)
+	client := newClient(params.Profile)
+	plugin := newSessionManagerPlugin(client.ssmSigningRegion, client.ssmEndpoint)
 
-	err = cli.checkSessionManagerPlugin()
+	err = plugin.check()
 	if err != nil {
 		return err
 	}
 
-	instanceId, availabilityZone, err := cli.findInstance(params)
+	instanceId, availabilityZone, err := client.findInstance(params)
 	if err != nil {
 		return err
 	}
 
-	err = cli.sendPublicKey(params, instanceId, availabilityZone)
+	err = client.sendPublicKey(params, instanceId, availabilityZone)
 	if err != nil {
 		return err
 	}
 
-	ssmIn, ssmOut, err := cli.startSession(params, instanceId)
+	ssmIn, ssmOut, err := client.startSession(params, instanceId)
 	if err != nil {
 		return err
 	}
 
-	err = cli.startSessionManagerPlugin(params, ssmIn, ssmOut)
+	err = plugin.start(params, ssmIn, ssmOut)
 	if err != nil {
 		return err
 	}
@@ -254,7 +255,28 @@ func (c *Client) startSession(params *Params, instanceId string) (in *ssm.StartS
 	return
 }
 
-func (*Client) checkSessionManagerPlugin() error {
+/*
+ * session-manager-plugin
+ */
+
+type SessionManagerPlugin interface {
+	check() error
+	start(params *Params, ssmInput *ssm.StartSessionInput, ssmOutput *ssm.StartSessionOutput) error
+}
+
+type SessionManagerPluginImpl struct {
+	signingRegion string
+	endpoint      string
+}
+
+func newSessionManagerPlugin(signingRegion string, endpoint string) SessionManagerPlugin {
+	return &SessionManagerPluginImpl{
+		signingRegion: signingRegion,
+		endpoint:      endpoint,
+	}
+}
+
+func (*SessionManagerPluginImpl) check() error {
 	_, err := exec.LookPath("session-manager-plugin")
 	if err != nil {
 		return fmt.Errorf("SessionManagerPlugin is not found. \n" +
@@ -265,7 +287,7 @@ func (*Client) checkSessionManagerPlugin() error {
 	return nil
 }
 
-func (c *Client) startSessionManagerPlugin(params *Params, in *ssm.StartSessionInput, out *ssm.StartSessionOutput) error {
+func (c *SessionManagerPluginImpl) start(params *Params, in *ssm.StartSessionInput, out *ssm.StartSessionOutput) error {
 	i, err := json.Marshal(in)
 	if err != nil {
 		return err
@@ -278,17 +300,17 @@ func (c *Client) startSessionManagerPlugin(params *Params, in *ssm.StartSessionI
 	cmd := exec.Command(
 		"session-manager-plugin",
 		string(o),
-		c.ssmSigningRegion,
+		c.signingRegion,
 		"StartSession",
 		params.Profile,
 		string(i),
-		c.ssmEndpoint,
+		c.endpoint,
 	)
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 
-	ignoreUserSignals(func() {
+	c.ignoreUserSignals(func() {
 		err = cmd.Run()
 	})
 	if err != nil {
@@ -298,11 +320,7 @@ func (c *Client) startSessionManagerPlugin(params *Params, in *ssm.StartSessionI
 	return nil
 }
 
-/*
- * Utility functions
- */
-
-func ignoreUserSignals(f func()) {
+func (*SessionManagerPluginImpl) ignoreUserSignals(f func()) {
 	var sig []os.Signal
 	if runtime.GOOS == "windows" {
 		sig = []os.Signal{syscall.SIGINT}
