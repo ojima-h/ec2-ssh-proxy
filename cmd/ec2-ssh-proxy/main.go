@@ -39,12 +39,6 @@ func run() error {
 	}
 
 	client := newClient(params.Profile)
-	plugin := newSessionManagerPlugin(client.ssmSigningRegion, client.ssmEndpoint)
-
-	err = plugin.check()
-	if err != nil {
-		return err
-	}
 
 	instanceId, availabilityZone, err := client.findInstance(params)
 	if err != nil {
@@ -56,19 +50,14 @@ func run() error {
 		return err
 	}
 
-	ssmIn, ssmOut, err := client.startSession(params, instanceId)
-	if err != nil {
-		return err
-	}
-
-	err = plugin.start(params, ssmIn, ssmOut)
+	err = client.startSession(params, instanceId)
 	if err != nil {
 		return err
 	}
 
 	return nil
 }
-
+s
 /*
  * Parse arguments
  */
@@ -175,6 +164,7 @@ type Client struct {
 
 	ssmSigningRegion string
 	ssmEndpoint      string
+	plugin SessionManagerPlugin
 }
 
 func newClient(profile string) *Client {
@@ -191,6 +181,8 @@ func newClient(profile string) *Client {
 	c.ssm = s
 	c.ssmSigningRegion = s.SigningRegion
 	c.ssmEndpoint = s.Endpoint
+
+	c.plugin = newSessionManagerPlugin()
 
 	return &c
 }
@@ -239,17 +231,27 @@ func (c *Client) sendPublicKey(params *Params, instanceId string, availabilityZo
 	return nil
 }
 
-func (c *Client) startSession(params *Params, instanceId string) (in *ssm.StartSessionInput, out *ssm.StartSessionOutput, err error) {
-	in = &ssm.StartSessionInput{
+func (c *Client) startSession(params *Params, instanceId string) (err error) {
+	err = c.plugin.check()
+	if err != nil {
+		return err
+	}
+
+	in := &ssm.StartSessionInput{
 		Target:       aws.String(instanceId),
 		DocumentName: aws.String("AWS-StartSSHSession"),
 		Parameters: map[string][]*string{
 			"portNumber": {aws.String(strconv.Itoa(params.Port))},
 		},
 	}
-	out, err = c.ssm.StartSession(in)
+	out, err := c.ssm.StartSession(in)
 	if err != nil {
 		return
+	}
+
+	err = c.plugin.start(params, c.ssmSigningRegion, c.ssmEndpoint, in, out)
+	if err != nil {
+		return err
 	}
 
 	return
@@ -261,19 +263,13 @@ func (c *Client) startSession(params *Params, instanceId string) (in *ssm.StartS
 
 type SessionManagerPlugin interface {
 	check() error
-	start(params *Params, ssmInput *ssm.StartSessionInput, ssmOutput *ssm.StartSessionOutput) error
+	start(params *Params, region string, endpoint string, ssmInput *ssm.StartSessionInput, ssmOutput *ssm.StartSessionOutput) error
 }
 
-type SessionManagerPluginImpl struct {
-	signingRegion string
-	endpoint      string
-}
+type SessionManagerPluginImpl struct {}
 
-func newSessionManagerPlugin(signingRegion string, endpoint string) SessionManagerPlugin {
-	return &SessionManagerPluginImpl{
-		signingRegion: signingRegion,
-		endpoint:      endpoint,
-	}
+func newSessionManagerPlugin() SessionManagerPlugin {
+	return &SessionManagerPluginImpl{}
 }
 
 func (*SessionManagerPluginImpl) check() error {
@@ -287,7 +283,7 @@ func (*SessionManagerPluginImpl) check() error {
 	return nil
 }
 
-func (c *SessionManagerPluginImpl) start(params *Params, in *ssm.StartSessionInput, out *ssm.StartSessionOutput) error {
+func (c *SessionManagerPluginImpl) start(params *Params, region string, endpoint string, in *ssm.StartSessionInput, out *ssm.StartSessionOutput) error {
 	i, err := json.Marshal(in)
 	if err != nil {
 		return err
@@ -300,11 +296,11 @@ func (c *SessionManagerPluginImpl) start(params *Params, in *ssm.StartSessionInp
 	cmd := exec.Command(
 		"session-manager-plugin",
 		string(o),
-		c.signingRegion,
+		region,
 		"StartSession",
 		params.Profile,
 		string(i),
-		c.endpoint,
+		endpoint,
 	)
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
