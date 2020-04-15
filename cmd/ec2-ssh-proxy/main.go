@@ -40,6 +40,11 @@ func run() error {
 
 	client := newClient(params.Profile)
 
+	err = client.checkPlugin()
+	if err != nil {
+		return err
+	}
+
 	instanceId, availabilityZone, err := client.findInstance(params)
 	if err != nil {
 		return err
@@ -57,7 +62,7 @@ func run() error {
 
 	return nil
 }
-s
+
 /*
  * Parse arguments
  */
@@ -231,12 +236,11 @@ func (c *Client) sendPublicKey(params *Params, instanceId string, availabilityZo
 	return nil
 }
 
-func (c *Client) startSession(params *Params, instanceId string) (err error) {
-	err = c.plugin.check()
-	if err != nil {
-		return err
-	}
+func (c *Client) checkPlugin() error {
+	return c.plugin.check()
+}
 
+func (c *Client) startSession(params *Params, instanceId string) (err error) {
 	in := &ssm.StartSessionInput{
 		Target:       aws.String(instanceId),
 		DocumentName: aws.String("AWS-StartSSHSession"),
