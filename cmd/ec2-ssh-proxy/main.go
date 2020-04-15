@@ -40,6 +40,11 @@ func run() error {
 
 	cli := newClient(params.Profile)
 
+	err = cli.checkSessionManagerPlugin()
+	if err != nil {
+		return err
+	}
+
 	instanceId, availabilityZone, err := cli.findInstance(params)
 	if err != nil {
 		return err
@@ -51,11 +56,6 @@ func run() error {
 	}
 
 	ssmIn, ssmOut, err := cli.startSession(params, instanceId)
-	if err != nil {
-		return err
-	}
-
-	err = cli.checkSessionManagerPlugin()
 	if err != nil {
 		return err
 	}
@@ -86,7 +86,7 @@ func parseArgs(args []string) (*Params, error) {
 	ret := Params{}
 
 	var opts struct {
-		Pattern string `long:"pattern" description:"Host name pattern" default:"ec2.%(name)"`
+		Pattern string `long:"pattern" description:"Host name pattern" default:"ec2.{name}"`
 		Profile string `long:"profile" description:"Aws credentials profile name"`
 		KeyFile string `long:"public-key" description:"SSH public key file path" default:"~/.ssh/id_rsa.pub"`
 		User    string `long:"user" description:"OS user on the EC2 instance" default:"ec2-user"`
